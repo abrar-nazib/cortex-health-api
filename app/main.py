@@ -15,6 +15,9 @@ from fastapi import FastAPI, HTTPException, UploadFile, File
 from fastapi.responses import FileResponse
 import imghdr
 from roboflow import Roboflow
+import psycopg2
+from psycopg2.extras import RealDictCursor
+import time
 # import uvicorn
 # from uvicorn.config import LOGGING_CONFIG
 # LOGGING_CONFIG["formatters"]["default"]["fmt"] = "%(asctime)s [%(name)s] %(levelprefix)s %(message)s"
@@ -57,23 +60,54 @@ brain_tumor_binary_project = rf.workspace().project(
 brain_tumor_binary_model = brain_tumor_binary_project.version(2).model
 
 
+while True:
+    try:
+        connection = psycopg2.connect(user="postgres",
+                                      password="robot",
+                                      host="localhost",
+                                      port="5432",
+                                      database="cortex",
+                                      cursor_factory=RealDictCursor)
+        # cursor_factory is used to return the result as a dictionary because normally column names are not returned
+        cursor = connection.cursor()  # create a cursor instance
+        # print a colored text to terminal
+        print("\033[92m" + "INFO:     Database connected successfully" + "\033[0m")
+
+        break  # break the loop if connection is successful
+    except Exception as e:
+        print("Connection to database failed")
+        print(f"Error: {e}")
+        time.sleep(2)  # give some time so that the database can start
+        exit(1)  # exit the program if connection fails
+
+
 def create_classifier_dict(class_name, confidence):
     results = {
         "predicted-class": f"{class_name}",
-        "confidence": f"{confidence}",
+        "confidence": float(f"{confidence}"),
     }
     return results
 
 
-def create_box_dict(class_name, confidence, x, y, w, h):
-    cx, cy = int(x + w/2), int(y + h/2)
-    radius = int(w/2) if w < h else int(h/2)
+def create_box_dict(class_name, confidence, x, y, w, h, img_w=512, img_h=512):
+    # convert every value to float
+    confidence, x, y, w, h, img_w, img_h = float(confidence), float(x), float(y), float(w), float(h), float(
+        img_w), float(img_h)
+    # calculate the center of the box
+    cx, cy = x + (w / 2), y + (h / 2)
+    # calculate the radius of the box
+    radius = w/2 if w < h else h/2
+
+    # scale the values according to the image size
+    cx, cy = (cx * (300/img_w))-150 - \
+        (radius/2), (cy * (300/img_h))-150 - (radius/2)
+    radius = radius * (300/img_w) + 2
     elem = {
         "predicted-class": f"{class_name}",
-        "confidence": f"{confidence}",
-        "cx": f"{cx}",
-        "cy": f"{cy}",
-        "radius": f"{radius}",
+        "confidence": confidence,
+        "cx": int(cx),
+        "cy": int(cy),
+        "radius": int(radius),
     }
     return elem
 
@@ -113,6 +147,8 @@ async def predict_pneumonia(file: UploadFile = File(...)):
     contents = await file.read()
     image = Image.open(BytesIO(contents)).convert("RGB")
     results = inference_pneumonia_predictor(image)
+    results["box"] = {}
+    print(results)
     return results
 
 
@@ -129,9 +165,10 @@ async def predict_liver_disease(file: UploadFile = File(...)):
     temp_image_path = f"{project_root}/temp/temp.jpg"
     image.save(temp_image_path)
 
-    result = liver_model.predict(f"{project_root}/temp/temp.jpg",
-                                 hosted=False, confidence=40, overlap=30).json()
-    predictions = result["predictions"]
+    locate_liver_disease = liver_model.predict(f"{project_root}/temp/temp.jpg",
+                                               hosted=False, confidence=40, overlap=30).json()
+    predictions = locate_liver_disease["predictions"]
+    img_w, img_h = locate_liver_disease["image"]["width"], locate_liver_disease["image"]["height"]
     return_dict = {}
 
     if (predictions != []):
@@ -139,18 +176,21 @@ async def predict_liver_disease(file: UploadFile = File(...)):
         predictions.sort(key=lambda x: x["confidence"], reverse=True)
         # get the top prediction
         top_prediction = predictions[0]
-        box_dict = create_box_dict(top_prediction["class"],
-                                   top_prediction["confidence"],
-                                   top_prediction["x"],
-                                   top_prediction["y"],
-                                   top_prediction["width"],
-                                   top_prediction["height"])
+        box_dict = create_box_dict(class_name=top_prediction["class"],
+                                   confidence=top_prediction["confidence"],
+                                   x=top_prediction["x"],
+                                   y=top_prediction["y"],
+                                   w=top_prediction["width"],
+                                   h=top_prediction["height"],
+                                   img_w=img_w,
+                                   img_h=img_h)
         return_dict = create_classifier_dict(
             top_prediction["class"], top_prediction["confidence"])
         return_dict["box"] = box_dict
     else:
         return_dict = create_classifier_dict("No Liver Disease", 1)
         return_dict["box"] = {}
+    print(return_dict)
     return return_dict
 
 
@@ -167,34 +207,89 @@ async def predict_brain_tumor(file: UploadFile = File(...)):
     temp_image_path = f"{project_root}/temp/temp.jpg"
     image.save(temp_image_path)
 
-    # Check if there is a tumor
-    checkTumor = brain_tumor_binary_model.predict(temp_image_path).json()
-    predictions = checkTumor["predictions"][0]
-    predicted_class = predictions["predicted_classes"][0]
-    prediction_object = predictions["predictions"][predicted_class]
-    confidence = prediction_object["confidence"]
-    if predicted_class == "notumor":
-        predicted_class = "Not Detected"
-    classifier_dict = create_classifier_dict(predicted_class, confidence)
-    classifier_dict["box"] = {}
+    try:
+        # Check if there is a tumor
+        checkTumor = brain_tumor_binary_model.predict(temp_image_path).json()
+        predictions = checkTumor["predictions"][0]
+        predicted_class = predictions["predicted_classes"][0]
+        prediction_object = predictions["predictions"][predicted_class]
+        confidence = prediction_object["confidence"]
+        if predicted_class == "notumor":
+            predicted_class = "Not Detected"
+        classifier_dict = create_classifier_dict(predicted_class, confidence)
+        classifier_dict["box"] = {}
 
-    locateTumor = brain_tumor_model.predict(f"{project_root}/temp/temp.jpg",
-                                            hosted=False, confidence=40, overlap=30).json()
-    # sort the predictions by confidence score
-    if (locateTumor["predictions"] != []):
-        locateTumor["predictions"].sort(
-            key=lambda x: x["confidence"], reverse=True)
-        # get the top prediction
-        top_prediction = locateTumor["predictions"][0]
-        classifier_dict["box"] = create_box_dict("tumor",
-                                                 top_prediction["confidence"],
-                                                 top_prediction["x"],
-                                                 top_prediction["y"],
-                                                 top_prediction["width"],
-                                                 top_prediction["height"])
+        locateTumor = brain_tumor_model.predict(f"{project_root}/temp/temp.jpg",
+                                                hosted=False, confidence=40, overlap=30).json()
+        img_w, img_h = locateTumor["image"]["width"], locateTumor["image"]["height"]
 
-    print(classifier_dict)
+        # sort the predictions by confidence score
+        if (locateTumor["predictions"] != []):
+            locateTumor["predictions"].sort(
+                key=lambda x: x["confidence"], reverse=True)
+            # get the top prediction
+            top_prediction = locateTumor["predictions"][0]
+            classifier_dict["box"] = create_box_dict("tumor",
+                                                     top_prediction["confidence"],
+                                                     top_prediction["x"],
+                                                     top_prediction["y"],
+                                                     top_prediction["width"],
+                                                     top_prediction["height"],
+                                                     img_w=img_w,
+                                                     img_h=img_h,
+                                                     )
+
+        print(classifier_dict)
+    except Exception as e:
+        print(e)
+        return {"message": "Error Occured"}
     return classifier_dict
+
+
+@app.post("/api/data-collector/collect/hematology")
+async def collect_data(body: dict):
+    data = {
+        "white_blood_cells": 8.30,
+        "neutrophil": 4.57,
+        "lymphocyte": 3.24,
+        "monocyte": 0.33,
+        "esinophil": 0.17,
+        "basophil": 0.00,
+        "red_blood_cells": 5.30,
+        "hemoglobin": 14.80,
+        "hct": 45.20,
+        "mcv": 85.30,
+        "mch": 27.90,
+        "mchc": 32.80,
+        "plateles": 347.00,
+        "mpv": 9.30,
+        "pct": 0.32,
+        "pdw": 9.90,
+        "reticulocyte": 0.00,
+        "esr": 90,
+        "label": "typhoid"
+    }
+    # create insert SQL query from data dictionary
+    query = "INSERT INTO hematology ("
+    for key in data.keys():
+        query += f"{key}, "
+    query = query[:-2] + ") VALUES ("
+    for key in data.keys():
+        # put sanitized values in the query
+        if (key == "label"):
+            query += f"'{data[key]}', "
+        else:
+            query += f"{data[key]}, "
+
+    query = query[:-2] + ") RETURNING *;"
+    # print(query)
+    cursor.execute(query)  # for sanitization, use %s instead of {}
+    data = cursor.fetchone()
+    connection.commit()
+    cursor.close()
+    connection.close()
+    # check whether the data was saved successfully
+    return data
 
 
 @app.get("/get")
@@ -206,6 +301,3 @@ async def getTest():
 async def postTest(body: dict):
 
     return {"message": "Post Request Working", "body": body}
-
-# if __name__ == "__main__":
-#     uvicorn.run(app, host="192.168.43.113", port=80)

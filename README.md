@@ -17,3 +17,7 @@ CORTEX-Health is an initiative towards automating disease diagnosis process usin
 ## API testing
 
 For the API documentation, after running the server, go to the `http://IP:PORT/docs` and create requests accordingly
+
+## Client APP
+
+The link to client application repository is https://github.com/AvikArefin/cortex-health-app.\
