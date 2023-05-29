@@ -20,4 +20,4 @@ For the API documentation, after running the server, go to the `http://IP:PORT/d
 
 ## Client APP
 
-The link to client application repository is https://github.com/AvikArefin/cortex-health-app.\
+The link to client application repository is https://github.com/AvikArefin/cortex-health-app
